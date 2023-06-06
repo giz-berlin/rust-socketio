@@ -34,7 +34,7 @@ jobs:
       - name: Build docker container
         run: |
           cd ci && docker build -t test_suite:latest .
-          docker run -d --name test_suite -p 4200:4200 -p 4201:4201 -p 4202:4202 -p 4203:4203 -p 4204:4204 -p 4205:4205 test_suite:latest
+          docker run -d --name test_suite -p 4200:4200 -p 4201:4201 -p 4202:4202 -p 4203:4203 -p 4204:4204 -p 4205:4205 -p 4206:4206 test_suite:latest
 
       - uses: actions/cache@v2
         with:
@@ -46,7 +46,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Generate code coverage
-        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+        run: RUSTFLAGS="--cfg tokio_unstable" cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
 
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v1.5.2

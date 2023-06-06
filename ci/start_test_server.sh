@@ -39,6 +39,14 @@ if [ $status -ne 0 ]; then
 fi
 echo "Successfully started socket.io restart instance"
 
+DEBUG=* node socket-io-force-disconnect.js &
+status=$?
+if [ $status -ne 0 ]; then
+  echo "Failed to start socket.io force disconnect instance: $status"
+  exit $status
+fi
+echo "Successfully started socket.io force disconnect instance"
+
 DEBUG=* node engine-io-secure.js &
 status=$?
 if [ $status -ne 0 ]; then

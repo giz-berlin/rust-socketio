@@ -447,11 +447,14 @@ mod test {
         time::{sleep, timeout},
     };
 
+    #[cfg(tokio_unstable)]
+    use tokio::runtime::{self, UnhandledPanic};
+
     use crate::{
         asynchronous::client::{builder::ClientBuilder, client::Client},
         error::Result,
         packet::{Packet, PacketId},
-        Payload, TransportType,
+        Event, Payload, TransportType,
     };
 
     #[tokio::test]
@@ -544,6 +547,95 @@ mod test {
         assert!(result.is_ok());
         // If the timeout did not trigger, the async callback was fully executed.
         let timeout = timeout(Duration::from_secs(5), notify.notified()).await;
+        assert!(timeout.is_ok());
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(tokio_unstable)]
+    fn socket_io_server_shutdown() {
+        let rt = runtime::Builder::new_current_thread()
+            .enable_all()
+            .unhandled_panic(UnhandledPanic::ShutdownRuntime)
+            .build()
+            .unwrap();
+
+        let test_task = rt.spawn(async {
+            // Test whether server shutdown is handled gracefully.
+            let url = crate::test::socket_io_force_disconnect_server();
+
+            // This synchronization mechanism is used to let the test know that the end of the
+            // async callback was reached.
+            let notify = Arc::new(tokio::sync::Notify::new());
+            let notify_clone = notify.clone();
+
+            let socket = ClientBuilder::new(url)
+                .on(Event::Error, move |payload, _| {
+                    let cl = notify_clone.clone();
+                    async move {
+                        if let Payload::String(payload_str) = payload {
+                            // Expect an EngineIO Error when the server disconnects
+                            assert!(payload_str == "EngineIO Error");
+                            cl.notify_one();
+                        }
+                    }
+                    .boxed()
+                })
+                .connect()
+                .await
+                .unwrap();
+
+            // waiting for server to emit message
+            sleep(Duration::from_millis(500)).await;
+
+            let r = socket.emit("force_disconnect", json!("")).await;
+            assert!(r.is_ok(), "should emit force_disconnect success");
+
+            // If the timeout did not trigger, the server disconnected and we didn't panic.
+            let timeout = timeout(Duration::from_secs(10), notify.notified()).await;
+            assert!(timeout.is_ok());
+        });
+
+        rt.block_on(async {
+            test_task.await.ok();
+        })
+    }
+
+    #[tokio::test]
+    async fn socket_io_server_shutdown2() -> Result<()> {
+        // Test whether server shutdown is handled gracefully.
+        let url = crate::test::socket_io_force_disconnect_server();
+
+        // This synchronization mechanism is used to let the test know that the end of the
+        // async callback was reached.
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let notify_clone = notify.clone();
+
+        let socket = ClientBuilder::new(url)
+            .on(Event::Error, move |payload, _| {
+                let cl = notify_clone.clone();
+                async move {
+                    if let Payload::String(payload_str) = payload {
+                        // Expect an EngineIO Error when the server disconnects
+                        assert!(payload_str == "EngineIO Error");
+                        cl.notify_one();
+                    }
+                }
+                .boxed()
+            })
+            .connect()
+            .await
+            .unwrap();
+
+        // waiting for server to emit message
+        sleep(Duration::from_millis(500)).await;
+
+        let r = socket.emit("force_disconnect", json!("")).await;
+        assert!(r.is_ok(), "should emit force_disconnect success");
+
+        // If the timeout did not trigger, the server disconnected and we didn't panic.
+        let timeout = timeout(Duration::from_secs(10), notify.notified()).await;
         assert!(timeout.is_ok());
 
         Ok(())

@@ -239,4 +239,19 @@ pub(crate) mod test {
 
         url
     }
+
+    // The socket.io restart server for testing runs on port 4206
+    const FORCE_DISCONNECT_SERVER_URL: &str = "http://localhost:4206";
+
+    pub(crate) fn socket_io_force_disconnect_server() -> Url {
+        let url = std::env::var("SOCKET_IO_FORCE_DISCONNECT_SERVER")
+            .unwrap_or_else(|_| FORCE_DISCONNECT_SERVER_URL.to_owned());
+        let mut url = Url::parse(&url).unwrap();
+
+        if url.path() == "/" {
+            url.set_path("/socket.io/");
+        }
+
+        url
+    }
 }
