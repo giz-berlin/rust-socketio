@@ -55,7 +55,7 @@ impl Client {
     ) -> Pin<Box<impl Stream<Item = Result<Packet>> + 'static + Send>> {
         Box::pin(try_stream! {
             let socket = socket.clone();
-            for await item in socket.as_stream() {
+            for await item in socket.clone() {
                 let packet = item?;
                 socket.handle_incoming_packet(packet.clone()).await?;
                 yield packet;
