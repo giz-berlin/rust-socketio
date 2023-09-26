@@ -2,15 +2,16 @@ use std::{
     fmt::Debug,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
+    time::SystemTime,
 };
 
 use async_stream::try_stream;
 use bytes::Bytes;
-use futures_util::{stream, Stream, StreamExt};
-use tokio::{runtime::Handle, sync::Mutex, time::Instant};
+use futures_util::{Stream, StreamExt};
+use tokio::{runtime::Handle, sync::Mutex};
 
 use crate::{
     asynchronous::{callback::OptionalCallback, transport::AsyncTransportType},
@@ -19,21 +20,22 @@ use crate::{
     Error, Packet, PacketId,
 };
 
+use super::generator::StreamGenerator;
+
 #[derive(Clone)]
 pub struct Socket {
     handle: Handle,
     transport: Arc<Mutex<AsyncTransportType>>,
-    transport_raw: AsyncTransportType,
     on_close: OptionalCallback<()>,
     on_data: OptionalCallback<Bytes>,
     on_error: OptionalCallback<String>,
     on_open: OptionalCallback<()>,
     on_packet: OptionalCallback<Packet>,
     connected: Arc<AtomicBool>,
-    last_ping: Arc<Mutex<Instant>>,
-    last_pong: Arc<Mutex<Instant>>,
+    last_ping: Arc<AtomicU64>,
+    last_pong: Arc<AtomicU64>,
     connection_data: Arc<HandshakePacket>,
-    max_ping_timeout: u64,
+    generator: StreamGenerator<Packet>,
 }
 
 impl Socket {
@@ -48,21 +50,104 @@ impl Socket {
     ) -> Self {
         let max_ping_timeout = handshake.ping_interval + handshake.ping_timeout;
 
+        let last_ping = Arc::new(AtomicU64::new(current_time_in_seconds()));
+        let last_pong = Arc::new(AtomicU64::new(current_time_in_seconds()));
+        let connected = Arc::new(AtomicBool::default());
+        let handle = Handle::current();
+
+        let generator = Self::enforce_timeout(
+            Self::stream(transport.clone()),
+            last_ping.clone(),
+            max_ping_timeout,
+            connected.clone(),
+            on_close.clone(),
+            handle.clone(),
+        );
+
         Socket {
-            handle: Handle::current(),
+            handle,
             on_close,
             on_data,
             on_error,
             on_open,
             on_packet,
-            transport: Arc::new(Mutex::new(transport.clone())),
-            transport_raw: transport,
-            connected: Arc::new(AtomicBool::default()),
-            last_ping: Arc::new(Mutex::new(Instant::now())),
-            last_pong: Arc::new(Mutex::new(Instant::now())),
+            transport: Arc::new(Mutex::new(transport)),
+            connected,
+            last_ping,
+            last_pong,
             connection_data: Arc::new(handshake),
-            max_ping_timeout,
+            generator: StreamGenerator::new(generator),
         }
+    }
+
+    /// Wraps the underlying stream in a different stream that respects max_timeout
+    fn enforce_timeout<'a, S: Stream<Item = Result<Packet>> + Send + Unpin + 'a>(
+        stream: S,
+        last_ping: Arc<AtomicU64>,
+        max_ping_timeout: u64,
+        connected: Arc<AtomicBool>,
+        on_close: OptionalCallback<()>,
+        handle: Handle,
+    ) -> Pin<Box<dyn Stream<Item = Result<Packet>> + Send + 'a>> {
+        let max_ping_timeout = Arc::new(max_ping_timeout);
+        futures_util::stream::unfold(
+            (
+                stream,
+                last_ping,
+                max_ping_timeout,
+                connected,
+                on_close,
+                handle,
+            ),
+            |(mut stream, last_ping, max_ping_timeout, connected, on_close, handle)| async {
+                // Wait for the next payload or until we should have received the next ping.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(
+                        Self::time_to_next_ping(last_ping.clone(), *max_ping_timeout.as_ref())
+                            .await,
+                    ),
+                    stream.next(),
+                )
+                .await
+                {
+                    Ok(result) => result.map(|result| {
+                        (
+                            result,
+                            (
+                                stream,
+                                last_ping,
+                                max_ping_timeout,
+                                connected,
+                                on_close,
+                                handle,
+                            ),
+                        )
+                    }),
+                    // We didn't receive a ping in time and now consider the connection as closed.
+                    Err(_) => {
+                        // FIXME: Don't love the duplication of implementation of self.disconnect...
+                        // Be nice and disconnect properly.
+                        connected.clone().store(false, Ordering::Relaxed);
+                        if let Some(callback) = on_close.clone().as_ref() {
+                            let on_close = callback.clone();
+                            handle.clone().spawn(async move { on_close(()).await });
+                        }
+                        Some((
+                            Err(Error::PingTimeout()),
+                            (
+                                stream,
+                                last_ping,
+                                max_ping_timeout,
+                                connected,
+                                on_close,
+                                handle,
+                            ),
+                        ))
+                    }
+                }
+            },
+        )
+        .boxed()
     }
 
     /// Opens the connection to a specified server. The first Pong packet is sent
@@ -77,7 +162,8 @@ impl Socket {
         }
 
         // set the last ping to now and set the connected state
-        *self.last_ping.lock().await = Instant::now();
+        self.last_ping
+            .store(current_time_in_seconds(), Ordering::Relaxed);
 
         // emit a pong packet to keep trigger the ping cycle on the server
         self.emit(Packet::new(PacketId::Pong, Bytes::new())).await?;
@@ -201,23 +287,22 @@ impl Socket {
     }
 
     pub(crate) async fn pinged(&self) {
-        *self.last_ping.lock().await = Instant::now();
+        self.last_ping
+            .store(current_time_in_seconds(), Ordering::Relaxed);
     }
 
-    /// Returns the time in milliseconds that is left until a new ping must be received.
+    /// Returns the time in seconds that is left until a new ping must be received.
     /// This is used to detect whether we have been disconnected from the server.
     /// See https://socket.io/docs/v4/how-it-works/#disconnection-detection
-    async fn time_to_next_ping(&self) -> u64 {
-        match Instant::now().checked_duration_since(*self.last_ping.lock().await) {
-            Some(since_last_ping) => {
-                let since_last_ping = since_last_ping.as_millis() as u64;
-                if since_last_ping > self.max_ping_timeout {
-                    0
-                } else {
-                    self.max_ping_timeout - since_last_ping
-                }
-            }
-            None => 0,
+    async fn time_to_next_ping(last_ping: Arc<AtomicU64>, max_ping_timeout: u64) -> u64 {
+        let current_time = current_time_in_seconds();
+        let last_ping = last_ping.load(Ordering::Relaxed);
+
+        let since_last_ping = current_time - last_ping;
+        if since_last_ping > max_ping_timeout {
+            0
+        } else {
+            max_ping_timeout - since_last_ping
         }
     }
 
@@ -243,35 +328,24 @@ impl Socket {
 
         self.connected.store(false, Ordering::Release);
     }
+}
 
-    /// Returns the packet stream for the client.
-    pub(crate) fn as_stream<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Stream<Item = Result<Packet>> + Send + 'a>> {
-        stream::unfold(
-            Self::stream(self.transport_raw.clone()),
-            |mut stream| async {
-                // Wait for the next payload or until we should have received the next ping.
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(self.time_to_next_ping().await),
-                    stream.next(),
-                )
-                .await
-                {
-                    Ok(result) => result.map(|result| (result, stream)),
-                    // We didn't receive a ping in time and now consider the connection as closed.
-                    Err(_) => {
-                        // Be nice and disconnect properly.
-                        if let Err(e) = self.disconnect().await {
-                            Some((Err(e), stream))
-                        } else {
-                            Some((Err(Error::PingTimeout()), stream))
-                        }
-                    }
-                }
-            },
-        )
-        .boxed()
+fn current_time_in_seconds() -> u64 {
+    // Safety: Current time is after the EPOCH
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+impl Stream for Socket {
+    type Item = Result<Packet>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.generator.poll_next_unpin(cx)
     }
 }
 
