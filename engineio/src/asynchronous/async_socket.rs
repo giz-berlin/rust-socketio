@@ -12,6 +12,8 @@ use bytes::Bytes;
 use futures_util::{stream, Stream, StreamExt};
 use tokio::{runtime::Handle, sync::Mutex, time::Instant};
 
+use log::{debug, error, trace};
+
 use crate::{
     asynchronous::{callback::OptionalCallback, transport::AsyncTransportType},
     error::Result,
@@ -251,6 +253,7 @@ impl Socket {
         stream::unfold(
             Self::stream(self.transport_raw.clone()),
             |mut stream| async {
+                trace!("Waiting for next packet from stream");
                 // Wait for the next payload or until we should have received the next ping.
                 match tokio::time::timeout(
                     std::time::Duration::from_millis(self.time_to_next_ping().await),
@@ -260,7 +263,12 @@ impl Socket {
                 {
                     Ok(result) => result.map(|result| (result, stream)),
                     // We didn't receive a ping in time and now consider the connection as closed.
-                    Err(_) => {
+                    Err(elapsed) => {
+                        error!("engineio stream did not return packet in time: {elapsed}");
+                        debug!(
+                            "last_ping: {:?} last_pong: {:?}",
+                            self.last_ping, self.last_pong
+                        );
                         // Be nice and disconnect properly.
                         if let Err(e) = self.disconnect().await {
                             Some((Err(e), stream))

@@ -1571,6 +1571,7 @@ dependencies = [
  "futures-util",
  "http",
  "lazy_static",
+ "log",
  "native-tls",
  "reqwest",
  "serde",
