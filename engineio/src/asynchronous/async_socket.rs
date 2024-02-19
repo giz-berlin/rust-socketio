@@ -1,4 +1,5 @@
 use std::{
+    borrow::BorrowMut,
     fmt::Debug,
     pin::Pin,
     sync::{
@@ -10,8 +11,8 @@ use std::{
 
 use async_stream::try_stream;
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
-use tokio::{runtime::Handle, sync::Mutex};
+use futures_util::{Future, FutureExt, Stream, StreamExt};
+use tokio::{runtime::Handle, sync::Mutex, time::Duration, time::Instant, time::Timeout};
 
 use crate::{
     asynchronous::{callback::OptionalCallback, transport::AsyncTransportType},
@@ -36,6 +37,8 @@ pub struct Socket {
     last_pong: Arc<AtomicU64>,
     connection_data: Arc<HandshakePacket>,
     generator: StreamGenerator<Packet>,
+    max_ping_timeout: u64,
+    sleep: Arc<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl Socket {
@@ -48,21 +51,13 @@ impl Socket {
         on_open: OptionalCallback<()>,
         on_packet: OptionalCallback<Packet>,
     ) -> Self {
-        let max_ping_timeout = handshake.ping_interval + handshake.ping_timeout;
+        // let max_ping_timeout = handshake.ping_interval + handshake.ping_timeout;
+        let max_ping_timeout = 10;
 
         let last_ping = Arc::new(AtomicU64::new(current_time_in_seconds()));
         let last_pong = Arc::new(AtomicU64::new(current_time_in_seconds()));
         let connected = Arc::new(AtomicBool::default());
         let handle = Handle::current();
-
-        let generator = Self::enforce_timeout(
-            Self::stream(transport.clone()),
-            last_ping.clone(),
-            max_ping_timeout,
-            connected.clone(),
-            on_close.clone(),
-            handle.clone(),
-        );
 
         Socket {
             handle,
@@ -71,14 +66,48 @@ impl Socket {
             on_error,
             on_open,
             on_packet,
-            transport: Arc::new(Mutex::new(transport)),
+            transport: Arc::new(Mutex::new(transport.clone())),
             connected,
             last_ping,
             last_pong,
             connection_data: Arc::new(handshake),
-            generator: StreamGenerator::new(generator),
+            generator: StreamGenerator::new(Self::stream(transport)), // TODO: what do I fill in here?
+            max_ping_timeout: max_ping_timeout,
+            sleep: Arc::new(Box::pin(tokio::time::sleep(
+                tokio::time::Duration::from_secs(max_ping_timeout),
+            ))),
         }
     }
+
+    /// Returns the packet stream for the client.
+    // pub(crate) fn as_stream<'a>(
+    //     &'a self,
+    //     transport: AsyncTransportType,
+    //     max_ping_timeout: u64,
+    // ) -> Pin<Box<dyn Stream<Item = Result<Packet>> + Send + 'a>> {
+    //     // let max_ping_timeout = Arc::new(max_ping_timeout);
+    //     futures_util::stream::unfold(Self::stream(transport.clone()), |mut stream| async {
+    //         // Wait for the next payload or until we should have received the next ping.
+    //         match tokio::time::timeout(
+    //             std::time::Duration::from_secs(Self::time_to_next_ping(self.last_ping.clone(), 64)),
+    //             stream.next(),
+    //         )
+    //         .await
+    //         {
+    //             Ok(result) => result.map(|result| (result, stream)),
+    //             // We didn't receive a ping in time and now consider the connection as closed.
+    //             Err(_) => {
+    //                 // Be nice and disconnect properly.
+    //                 if let Err(e) = self.disconnect().await {
+    //                     Some((Err(e), stream))
+    //                 } else {
+    //                     Some((Err(Error::PingTimeout()), stream))
+    //                 }
+    //             }
+    //         }
+    //     })
+    //     .boxed()
+    // }
 
     /// Wraps the underlying stream in a different stream that respects max_timeout
     fn enforce_timeout<'a, S: Stream<Item = Result<Packet>> + Send + Unpin + 'a>(
@@ -102,10 +131,10 @@ impl Socket {
             |(mut stream, last_ping, max_ping_timeout, connected, on_close, handle)| async {
                 // Wait for the next payload or until we should have received the next ping.
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(
-                        Self::time_to_next_ping(last_ping.clone(), *max_ping_timeout.as_ref())
-                            .await,
-                    ),
+                    std::time::Duration::from_secs(Self::time_to_next_ping(
+                        last_ping.clone(),
+                        *max_ping_timeout.as_ref(),
+                    )),
                     stream.next(),
                 )
                 .await
@@ -294,7 +323,7 @@ impl Socket {
     /// Returns the time in seconds that is left until a new ping must be received.
     /// This is used to detect whether we have been disconnected from the server.
     /// See https://socket.io/docs/v4/how-it-works/#disconnection-detection
-    async fn time_to_next_ping(last_ping: Arc<AtomicU64>, max_ping_timeout: u64) -> u64 {
+    fn time_to_next_ping(last_ping: Arc<AtomicU64>, max_ping_timeout: u64) -> u64 {
         let current_time = current_time_in_seconds();
         let last_ping = last_ping.load(Ordering::Relaxed);
 
@@ -345,7 +374,64 @@ impl Stream for Socket {
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.generator.poll_next_unpin(cx)
+        let me = self.get_mut();
+        let ttnp = Self::time_to_next_ping(me.last_ping.clone(), me.max_ping_timeout);
+        println!("polling");
+        // Poll the generator first
+        match me.generator.next().poll_unpin(cx) {
+            std::task::Poll::Ready(Some(value)) => {
+                println!("value from stream some");
+                return std::task::Poll::Ready(Some(value));
+            }
+            std::task::Poll::Ready(None) => {
+                println!("value from stream none");
+                // Generator finished, return None
+                return std::task::Poll::Ready(None);
+            }
+            std::task::Poll::Pending => {
+                println!("pending ttnp {ttnp}");
+            }
+        };
+
+        println!("sleeping ttnp {ttnp}");
+
+        let timeout = tokio::time::Instant::now()
+            .checked_add(tokio::time::Duration::from_secs(ttnp))
+            .unwrap()
+        
+
+        me.sleep.then(|| => {
+            
+        })
+        std::task::Poll::Pending
+
+        // match timeout.poll(cx) {
+        //     std::task::Poll::Ready(timeout) => {
+        //         println!("timeout ready");
+        //         match timeout {
+        //             // Stream / generator has new value.
+        //             Ok(value) => {
+        //                 println!("message from generator");
+        //                 return std::task::Poll::Ready(value);
+        //             }
+        //             Err(elapsed) => {
+        //                 // Be nice and disconnect properly.
+        //                 // if let Err(e) = self.disconnect().await {
+        //                 //     return std::task::Poll::Ready(Some(Err(e)));
+        //                 // } else {
+        //                 //     return std::task::Poll::Ready(Some(Err(Error::PingTimeout())));
+        //                 // }
+        //                 println!("timeout elapsed: {elapsed}");
+        //                 // TODO: remove
+        //                 return std::task::Poll::Pending;
+        //             }
+        //         }
+        //     }
+        //     std::task::Poll::Pending => {
+        //         println!("timeout pending");
+        //         std::task::Poll::Pending
+        //     }
+        // }
     }
 }
 
