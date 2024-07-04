@@ -2,7 +2,7 @@ use std::{ops::DerefMut, pin::Pin, sync::Arc};
 
 use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
 use futures_util::{future::BoxFuture, stream, Stream, StreamExt};
-use log::trace;
+use log::{error, trace};
 use rand::{thread_rng, Rng};
 use serde_json::Value;
 use tokio::{
@@ -162,7 +162,21 @@ impl Client {
                 drop(stream);
 
                 let should_reconnect = match *(client_clone.disconnect_reason.read().await) {
-                    DisconnectReason::Unknown => reconnect,
+                    DisconnectReason::Unknown => {
+                        // If we disconnected for an unknown reason, the client might not have noticed
+                        // the closure yet. Hence, fire a transport close event to notify it.
+                        // We don't need to do that in the other cases, since proper server close
+                        // and manual client close are handled explicitly.
+                        if let Some(err) = client_clone
+                            .callback(&Event::Close, "transport close")
+                            .await
+                            .err()
+                        {
+                            error!("Error while notifying client of transport close: {err}")
+                        }
+
+                        reconnect
+                    }
                     DisconnectReason::Manual => false,
                     DisconnectReason::Server => reconnect_on_disconnect,
                 };
